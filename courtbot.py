@@ -368,7 +368,9 @@ class DiscordCourtBot(discord.Client):
         self._ping_rate_limit = {}
         
         # Pre-compile regex patterns for performance
-        self._mention_pattern = re.compile(r'<@\d+>')
+        self._user_mention_pattern = re.compile(r'<@!?(\d+)>')
+        self._role_mention_pattern = re.compile(r'<@&(\d+)>')
+        self._channel_mention_pattern = re.compile(r'<#(\d+)>')
         self._bgm_pattern = re.compile(r'\[#bgm(\d+)\]')
         self._sfx_pattern = re.compile(r'\[#bgs(\d+)\]')
         self._evidence_pattern = re.compile(r'\[#evdi?(\d+)\]')
@@ -376,6 +378,85 @@ class DiscordCourtBot(discord.Client):
         self._discord_cdn_pattern = re.compile(r'https?://(?:media\.discordapp\.net|cdn\.discordapp\.com|cdn\.discord\.com)/attachments/\S+')
         self._discord_domain_pattern = re.compile(r'^https?://[^/]*discord(?:app)?\.(?:com|net)(?:/|$)', re.IGNORECASE)
     
+    def _resolve_guild(self, message=None):
+        """Find the guild to use for mention lookups"""
+        if message is not None and getattr(message, 'guild', None):
+            return message.guild
+        if self.bridge_channel is not None:
+            return self.bridge_channel.guild
+        if self.guild_id:
+            return self.get_guild(self.guild_id)
+        return None
+
+    def resolve_mentions(self, content, message=None):
+        """Convert Discord mention markup into readable plain text.
+
+        <@123>/<@!123> -> @Nickname (bridge nickname if set, else server display name)
+        <@&123>        -> @RoleName
+        <#123>         -> #channel-name
+
+        Anything that cannot be resolved is replaced with a generic placeholder so
+        raw snowflake IDs are never relayed to the courtroom.
+        """
+        if not content or '<' not in content:
+            return content
+
+        guild = self._resolve_guild(message)
+
+        # Names Discord already resolved for us on the message object (most reliable)
+        resolved_users = {}
+        if message is not None:
+            for user in getattr(message, 'mentions', None) or []:
+                resolved_users[user.id] = getattr(user, 'display_name', None) or user.name
+        resolved_roles = {}
+        if message is not None:
+            for role in getattr(message, 'role_mentions', None) or []:
+                resolved_roles[role.id] = role.name
+        resolved_channels = {}
+        if message is not None:
+            for channel in getattr(message, 'channel_mentions', None) or []:
+                resolved_channels[channel.id] = getattr(channel, 'name', None)
+
+        def user_repl(match):
+            uid = int(match.group(1))
+            # Prefer the bridge nickname so the mention matches how that user
+            # appears inside the courtroom
+            name = self.nicknames.get(str(uid))
+            if not name:
+                name = resolved_users.get(uid)
+            if not name and guild is not None:
+                member = guild.get_member(uid)
+                if member:
+                    name = member.display_name or member.name
+            if not name:
+                user = self.get_user(uid)
+                if user:
+                    name = getattr(user, 'display_name', None) or user.name
+            return f"@{name}" if name else "@someone"
+
+        def role_repl(match):
+            rid = int(match.group(1))
+            name = resolved_roles.get(rid)
+            if not name and guild is not None:
+                role = guild.get_role(rid)
+                if role:
+                    name = role.name
+            return f"@{name}" if name else "@role"
+
+        def channel_repl(match):
+            cid = int(match.group(1))
+            name = resolved_channels.get(cid)
+            if not name:
+                channel = self.get_channel(cid)
+                if channel is not None:
+                    name = getattr(channel, 'name', None)
+            return f"#{name}" if name else "#channel"
+
+        content = self._role_mention_pattern.sub(role_repl, content)
+        content = self._user_mention_pattern.sub(user_repl, content)
+        content = self._channel_mention_pattern.sub(channel_repl, content)
+        return content
+
     async def fetch_music_url(self, bgm_id, validate_url=False):
         """Fetch the actual external URL for a BGM ID from objection.lol's API
         
@@ -1775,11 +1856,6 @@ class DiscordCourtBot(discord.Client):
             if any(pattern in message.content for pattern in ignore_patterns):
                 return
             
-            # Ignore messages with Discord user mentions (<@numbers>)
-            if self._mention_pattern.search(message.content):
-                print(f"🚫 Ignoring message with user mention: {message.content[:50]}...")
-                return
-            
             # Note: !commands (8ball, slap, roll) are NOT handled here on Discord side
             # They get relayed to courtroom where the bot processes them and sends embeds back
             # This prevents duplicate responses
@@ -1813,6 +1889,14 @@ class DiscordCourtBot(discord.Client):
                         if base_url in auth_url_map:
                             message_content = message_content.replace(bare_url, auth_url_map[base_url])
                             log_verbose(f"🔑 Replaced bare Discord CDN URL with authenticated version")
+            
+            # Convert Discord mentions (<@id>, <@&id>, <#id>) into readable names
+            # so messages containing mentions can be relayed instead of dropped
+            if '<' in message_content:
+                resolved_content = self.resolve_mentions(message_content, message)
+                if resolved_content != message_content:
+                    log_verbose(f"🏷️ Resolved mentions: {message_content[:50]}... → {resolved_content[:50]}...")
+                    message_content = resolved_content
             
             # Prepare message content with media
             content_parts = []
@@ -1906,7 +1990,7 @@ class DiscordCourtBot(discord.Client):
                 log_verbose(f"🔄 Reset avatar tracking after Discord message")
                 
                 # Log the message in simple format for non-verbose mode
-                log_message("Discord", display_name, message.content if message.content else "[media]")
+                log_message("Discord", display_name, message_content if message_content else "[media]")
                 log_verbose(f"🔄 Discord → Queue: {target_username}: {send_content[:50]}...")
             else:
                 log_verbose(f"❌ Failed to queue message to objection.lol")
@@ -1918,6 +2002,10 @@ class DiscordCourtBot(discord.Client):
         if self.bridge_channel:
             # Strip color codes before sending to Discord
             cleaned_message = self.strip_color_codes(message)
+            
+            # Convert any raw mention markup typed in the courtroom into plain
+            # text names (no accidental pings, no raw snowflake IDs on display)
+            cleaned_message = self.resolve_mentions(cleaned_message)
             
             # Check for BGM commands and fetch music URLs (limit to 3 per message to prevent spam)
             bgm_ids = self.extract_bgm_commands(message)
@@ -2160,14 +2248,20 @@ class DiscordCourtBot(discord.Client):
                 else:
                     # Send as plain text without avatar (no avatar available OR same user+pose as last message)
                     formatted_message = f"**{username}**:\n{cleaned_message}\n-# <t:{unix_timestamp}:T>"
-                    sent_message = await self.bridge_channel.send(formatted_message)
+                    sent_message = await self.bridge_channel.send(
+                        formatted_message,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
             except Exception as e:
                 # If embed sending fails (e.g., bad avatar URL), fall back to plain text
                 print(f"⚠️ Failed to send message as embed: {e}")
                 log_verbose(f"⚠️ Falling back to plain text for: {username}: {cleaned_message}")
                 try:
                     formatted_message = f"**{username}**:\n{cleaned_message}\n-# <t:{unix_timestamp}:T>"
-                    sent_message = await self.bridge_channel.send(formatted_message)
+                    sent_message = await self.bridge_channel.send(
+                        formatted_message,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
                 except Exception as e2:
                     print(f"❌ Failed to send message even as plain text: {e2}")
                     return  # Exit early if we can't send at all
@@ -2528,6 +2622,7 @@ class ObjectionBot:
         
         # Admin and moderation settings
         self.is_admin = False
+        self.room_owner_id = None  # Last known room owner ID (from room updates / transfers)
         self.current_mods = set()  # Set of current moderator user IDs
         self.banned_users = []  # List of banned users (only available when admin)
         
@@ -2554,7 +2649,6 @@ class ObjectionBot:
         self._discord_queue_processor_task = None
         
         # Pre-compile regex patterns for performance
-        self._mention_pattern = re.compile(r'<@\d+>')
         self._color_code_pattern = re.compile(r'\[#/[a-zA-Z]\]|\[#/c[a-fA-F0-9]{6}\]|\[/#\]|\[#ts\d+\]')
     
     async def connect_to_room(self):
@@ -2983,10 +3077,8 @@ class ObjectionBot:
             if any(pattern in text for pattern in ignore_patterns):
                 return
             
-            # Ignore messages with Discord user mentions (<@numbers>)
-            if self._mention_pattern.search(text):
-                log_verbose(f"🚫 Ignoring objection.lol message with user mention: {text[:50]}...")
-                return
+            # Note: raw Discord mention markup (<@id>) is converted to plain text
+            # names in DiscordCourtBot.send_to_discord instead of dropping the message
             
             # Get username from our stored mapping
             username = self.user_names.get(user_id)
@@ -3025,10 +3117,8 @@ class ObjectionBot:
             if any(pattern in text for pattern in ignore_patterns):
                 return
             
-            # Ignore messages with Discord user mentions (<@numbers>)
-            if self._mention_pattern.search(text):
-                log_verbose(f"🚫 Ignoring objection.lol plain message with user mention: {text[:50]}...")
-                return
+            # Note: raw Discord mention markup (<@id>) is converted to plain text
+            # names in DiscordCourtBot.send_to_discord instead of dropping the message
             
             # Get username from our stored mapping
             username = self.user_names.get(user_id)
@@ -3127,6 +3217,16 @@ class ObjectionBot:
             else:
                 print(f"[MOD] No existing moderators in room")
         
+        # Detect room owner to sync admin status. This covers the case where the
+        # bot becomes owner automatically (e.g., joining an empty courtroom),
+        # since no owner_transfer event is sent in that scenario.
+        owner_id = data.get('ownerId') or data.get('owner')
+        if isinstance(owner_id, dict):
+            owner_id = owner_id.get('id')
+        if isinstance(owner_id, str) and owner_id:
+            self.room_owner_id = owner_id
+            self.sync_admin_status()
+        
         # Signal username change event if our username was updated
         if self.user_id:
             for user in valid_users:
@@ -3135,11 +3235,28 @@ class ObjectionBot:
                         log_verbose(f"[DEBUG] Username for our user_id matched pending username: {self._pending_username}")
                         self._username_change_event.set()
     
+    def sync_admin_status(self):
+        """Sync is_admin from the last known room owner ID.
+        
+        Needed because owner_transfer events only fire on explicit transfers -
+        a bot that is owner from the start (empty courtroom) would otherwise
+        never get is_admin set."""
+        if not self.user_id or not self.room_owner_id:
+            return  # Can't determine yet (waiting for 'me' response or room data)
+        if self.room_owner_id == self.user_id and not self.is_admin:
+            self.is_admin = True
+            print("👑 Bot is the room owner - admin status enabled (detected from room data)")
+        elif self.room_owner_id != self.user_id and self.is_admin:
+            self.is_admin = False
+            print("👑 Bot is no longer admin - room owner is someone else (detected from room data)")
+    
     async def handle_me_response(self, data):
         """Handle 'me' response to get our user ID"""
         if 'user' in data and 'id' in data['user']:
             self.user_id = data['user']['id']
             log_verbose(f"🤖 Bot ID: {self.user_id}")
+            # Re-check admin status in case room data arrived before the 'me' response
+            self.sync_admin_status()
     
     async def handle_user_joined(self, data):
         """Handle user_joined events"""
@@ -3260,6 +3377,9 @@ class ObjectionBot:
         """Handle owner/admin transfer events"""
         print(f"[ADMIN] Received owner_transfer: new_owner_id={new_owner_id}, room_code={room_code}")
         
+        # Track the current room owner
+        self.room_owner_id = new_owner_id
+        
         # Check if the bot received admin status
         if new_owner_id == self.user_id:
             print("🎯 Bot has been granted admin/owner status!")
@@ -3337,6 +3457,13 @@ class ObjectionBot:
     async def handle_update_room_admin(self, admin_data):
         """Handle admin-only room updates (includes ban list and other admin settings)"""
         print(f"[ADMIN] Received update_room_admin: {admin_data}")
+        
+        # The server only sends update_room_admin to the room admin, so receiving
+        # it is a reliable signal that the bot has admin status (covers rooms
+        # where ownership was granted without an owner_transfer event)
+        if not self.is_admin:
+            self.is_admin = True
+            print("👑 Bot received admin-only room data - admin status enabled")
         
         # Extract ban list if present
         if isinstance(admin_data, dict) and 'bans' in admin_data:
@@ -3465,11 +3592,18 @@ class ObjectionBot:
             print(f"[BAN] Error banning user: {e}")
             return False
     
-    async def remove_ban(self, user_id):
+    async def remove_ban(self, ban_id):
         """Unban a user from the courtroom (admin only)
-        
-        Uses the update_room_admin WebSocket message to update the ban list.
-        Format: 42["update_room_admin",{"bans":[...],"password":"","autoTransferAdmin":true},"roomCode"]
+
+        IMPORTANT: ban_id is the *ban record* id from the 'bans' list in
+        update_room_admin, NOT the user's session id. Session ids (as used by
+        create_ban / user_joined / user_left) are ephemeral and change every
+        time a user reconnects, so the server assigns each ban its own id.
+        Format: 42["remove_ban","<banId>"]
+
+        Note: the ban list cannot be modified through update_room_admin - the
+        server ignores a "bans" field there and only honours "password" and
+        "autoTransferAdmin".
         """
         if not self.is_admin:
             print("[UNBAN] Cannot unban user - bot is not admin")
@@ -3480,34 +3614,26 @@ class ObjectionBot:
             return False
         
         try:
-            # Find and remove the user from the banned_users list
-            user_to_unban = None
+            # Find the matching entry in the banned_users list
+            ban_to_remove = None
             for ban in self.banned_users:
-                if ban.get('id') == user_id:
-                    user_to_unban = ban
+                if ban.get('id') == ban_id:
+                    ban_to_remove = ban
                     break
             
-            if not user_to_unban:
-                print(f"[UNBAN] User ID {user_id[:8]}... not found in ban list")
+            if not ban_to_remove:
+                print(f"[UNBAN] Ban ID {ban_id[:8]}... not found in ban list")
                 return False
             
-            # Create new ban list without the unbanned user
-            new_bans = [ban for ban in self.banned_users if ban.get('id') != user_id]
-            
-            # Send update_room_admin message with the new ban list
-            # Format: 42["update_room_admin",{"bans":[{"id":"...","username":"..."},...],"password":"","autoTransferAdmin":true},"roomCode"]
-            update_data = {
-                "bans": new_bans,
-                "password": "",  # Keep existing password (empty string means no change)
-                "autoTransferAdmin": True  # Keep auto-transfer enabled
-            }
-            message = f'42["update_room_admin",{json.dumps(update_data)},"{self.room_id}"]'
+            # Send remove_ban with the ban id as a plain string argument
+            message = f'42["remove_ban",{json.dumps(ban_id)}]'
             await self.websocket.send(message)
             
-            # Update local ban list
-            username = user_to_unban.get('username', f"User-{user_id[:8]}")
-            self.banned_users = new_bans
-            print(f"[UNBAN] Unbanned user: {username} ({user_id[:8]}...)")
+            # Optimistically update local ban list (server will broadcast the
+            # authoritative list via update_room_admin)
+            username = ban_to_remove.get('username', f"Ban-{ban_id[:8]}")
+            self.banned_users = [ban for ban in self.banned_users if ban.get('id') != ban_id]
+            print(f"[UNBAN] Unbanned user: {username} ({ban_id[:8]}...)")
             return True
         except Exception as e:
             print(f"[UNBAN] Error unbanning user: {e}")
